@@ -1,91 +1,97 @@
 # 🔐 Encrypted Chat Room
 
-End-to-end encrypted chat room with password login. Messages are encrypted client-side using AES-256-GCM before being stored in Cloudflare KV.
+End-to-end encrypted chat room. Messages are AES-256-GCM encrypted **in the browser** before ever reaching the server.
 
-## How it works
+## Security Design
 
-1. **Password authentication** — enter the shared password to unlock chat history
-2. **Client-side encryption** — PBKDF2 derives an AES-256-GCM key from your password
-3. **Messages stored encrypted** — all chat messages are encrypted before hitting the server
-4. **Only decrypted in-browser** — even the server never sees plaintext messages
+| What | Where it lives | Why |
+|------|---------------|-----|
+| Password | Cloudflare **Secrets** (dashboard) | Encrypted at rest, never in logs |
+| KV namespace ID | Cloudflare **Bindings** (dashboard) | Never exposed in code |
+| Encryption key | Derived in-browser from password | Server never sees plaintext |
+| Messages | Stored encrypted in KV | Even KV compromise = no read access |
 
-## Files
-
-| File | Purpose |
-|------|---------|
-| `index.html` | Login + chat UI |
-| `style.css` | Dark-themed styling |
-| `app.js` | Encryption logic + API calls |
-| `worker.js` | Cloudflare Worker backend |
-| `wrangler.toml.example` | Template config (commit this) |
-| `wrangler.toml` | Local config only (git-ignored, don't commit) |
+**Zero secrets in code. Zero IDs in config files.** Everything is bound from the Cloudflare dashboard.
 
 ---
 
-## Why Password Goes as a **Secret**, Not a Variable
+## How to Deploy
 
-In Cloudflare Workers there are two types of env config:
-
-| Type | Where it lives | Visibility | Use for |
-|------|---------------|------------|---------|
-| **Variable** | Dashboard → Settings → Variables | Plain text, visible in logs | Public config (e.g. feature flags) |
-| **Secret** | Dashboard → Settings → Secrets | Encrypted, hidden, never in logs | Passwords, API keys, tokens |
-
-**Always use Secrets for passwords.** If you put `PASSWORD` as a Variable, it will be logged in plain text in Cloudflare's request logs. Secrets are encrypted at rest and never appear in logs.
-
-## Deploy to Cloudflare (Step by Step)
-
-### Prerequisites
-- Wrangler installed: `npm install -g wrangler`
-- Logged in: `wrangler login`
-
-### Step 1 — Create KV Namespace
+### Step 1 — Push code to GitHub
 ```bash
-wrangler kv namespace create CHAT_KV
+git push origin main
 ```
-Copy the returned `id` (looks like `xxxxxxxxxxxxxxxxxxxxxxxx`)
+Already done. The repo is at: https://github.com/transfermer/encrypted-group-chat
 
-### Step 2 — Set Password as Secret
-```bash
-wrangler secret put PASSWORD
-# You'll be prompted to type the password (hidden input)
-```
+### Step 2 — Create KV Namespace in Cloudflare Dashboard
+1. Go to: https://dash.cloudflare.com → **KV** → **Create Namespace**
+2. Name: `CHAT_KV` (must match the binding name in worker.js)
+3. Note the **Namespace ID** (you won't need to paste it anywhere — see Step 4)
 
-### Step 3 — Update wrangler.toml (local only, git-ignored)
-```bash
-cp wrangler.toml.example wrangler.toml
-# Edit wrangler.toml and paste your KV namespace ID into id = "..."
-```
+### Step 3 — Deploy Worker via Dashboard
+1. Go to: https://dash.cloudflare.com → **Workers & Pages** → **Create Application** → **Worker**
+2. **Deploy from Git** → connect your GitHub account → select `transfermer/encrypted-group-chat`
+3. **Framework**: None
+4. **Build command**: (leave empty)
+5. Click **Deploy**
 
-### Step 4 — Deploy Worker
-```bash
-wrangler deploy
-```
+### Step 4 — Configure Bindings & Secrets in Dashboard
+After deployment, go to your Worker's **Settings**:
 
-### Step 5 — Commit everything except wrangler.toml
-```bash
-git add index.html style.css app.js worker.js wrangler.toml.example .gitignore README.md
-git commit -m "feat: encrypted chat room"
-git push
-```
+**Variables and Secrets:**
+| Name | Type | Value |
+|------|------|-------|
+| `PASSWORD` | **Secret** | Your chat password (e.g. `my-secret-pass`) |
 
-`wrangler.toml` stays local — **never committed**.
+**KV Namespace Bindings:**
+| Binding Name | Namespace |
+|-------------|-----------|
+| `CHAT_KV` | `CHAT_KV` (the one you created in Step 2) |
+
+Click **Save**.
+
+### Step 5 — Done
+Your chat is live at `https://encrypted-chat.<your-worker-name>.workers.dev`
 
 ---
 
 ## Architecture
 
 ```
-Browser (AES-GCM encrypt/decrypt)
+Browser (AES-256-GCM encrypt/decrypt in JS)
     ↓ HTTPS
-Cloudflare Worker (routes API)
+Cloudflare Worker  ←  env.PASSWORD (secret), env.CHAT_KV (binding)
     ↓
-Cloudflare KV (stores encrypted JSON blobs)
+Cloudflare KV  ←  stores only encrypted base64 blobs
 ```
 
-## Security Notes
+## Files in This Repo
 
-- **Server cannot read messages** — encryption happens entirely in the browser
-- **Password is sent over HTTPS** — always use HTTPS in production
-- **KV stores encrypted blobs** — even if KV is compromised, messages are safe
-- **No user auth** — anyone with the password sees everything (by design)
+| File | Purpose |
+|------|---------|
+| `index.html` | Login + chat UI |
+| `style.css` | Dark themed styling |
+| `app.js` | Client-side encryption (AES-GCM) |
+| `worker.js` | Server API — reads secrets/boundings from env only |
+| `wrangler.toml.example` | Template for local dev (not committed with IDs) |
+| `.gitignore` | Keeps `wrangler.toml` local-only |
+
+## Local Development (Optional)
+
+```bash
+# 1. Copy example config (local only, git-ignored)
+cp wrangler.toml.example wrangler.toml
+
+# 2. Create KV namespace locally
+wrangler kv namespace create CHAT_KV
+
+# 3. Set password secret
+wrangler secret put PASSWORD
+# (you'll be prompted)
+
+# 4. Edit wrangler.toml — paste the KV namespace ID into the id field
+#    (this file is git-ignored, never committed)
+
+# 5. Run locally
+wrangler dev
+```

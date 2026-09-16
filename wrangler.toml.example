@@ -1,3 +1,7 @@
 name = "encrypted-chat"
 main = "worker.js"
 compatibility_date = "2024-01-01"
+
+# KV binding — namespace ID is configured in Cloudflare dashboard, NOT here
+[[kv_namespaces]]
+binding = "CHAT_KV"
