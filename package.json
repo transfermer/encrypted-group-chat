@@ -1,0 +1,16 @@
+{
+	"name": "encrypted-group-chat",
+	"version": "1.0.0",
+	"private": true,
+	"description": "Password-gated, end-to-end encrypted group chat on Cloudflare Workers",
+	"type": "module",
+	"scripts": {
+		"dev": "wrangler dev",
+		"deploy": "wrangler deploy",
+		"tail": "wrangler tail",
+		"test": "node tests/worker.test.mjs"
+	},
+	"devDependencies": {
+		"wrangler": "^4.0.0"
+	}
+}

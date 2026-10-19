@@ -1,0 +1,22 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "encrypted-group-chat",
+	"main": "src/worker.js",
+	"compatibility_date": "2025-09-01",
+	"keep_vars": true,
+	"assets": {
+		"directory": "./public",
+		"binding": "ASSETS",
+		"run_worker_first": [
+			"/api/*"
+		]
+	},
+	"kv_namespaces": [
+		{
+			"binding": "CHAT_KV"
+		}
+	],
+	"observability": {
+		"enabled": true
+	}
+}

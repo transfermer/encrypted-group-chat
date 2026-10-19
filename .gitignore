@@ -1,4 +1,11 @@
 node_modules/
 .wrangler/
 .dev.vars
+.dev.vars.*
+.env
+.env.*
+dist/
+
+# Local-only Wrangler config. wrangler.jsonc (committed) holds no secrets and
+# no resource IDs — the KV namespace is auto-provisioned by Cloudflare on deploy.
 wrangler.toml

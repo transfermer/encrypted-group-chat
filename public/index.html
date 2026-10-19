@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Encrypted Group Chat</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="shell">
+    <!-- Login / unlock -->
+    <section id="login-view" class="card">
+      <h1>&#128274; Encrypted Group Chat</h1>
+      <p class="hint">Enter the room password to unlock the full chat history.</p>
+
+      <form id="login-form" autocomplete="off">
+        <label for="name-input">Display name</label>
+        <input id="name-input" type="text" maxlength="32" placeholder="e.g. Alice" autocomplete="nickname">
+
+        <label for="password-input">Room password</label>
+        <input id="password-input" type="password" placeholder="Password" autocomplete="current-password" required>
+
+        <button id="login-btn" type="submit">Unlock</button>
+      </form>
+
+      <p id="login-status" class="status" role="status" aria-live="polite"></p>
+      <p class="fineprint">
+        Messages are encrypted in your browser with AES-256-GCM before upload.
+        The server stores ciphertext only and never sees the key.
+      </p>
+    </section>
+
+    <!-- Chat -->
+    <section id="chat-view" class="card hidden">
+      <header class="chat-head">
+        <h1>&#128172; <span id="room-title">Chat</span></h1>
+        <div class="chat-head-actions">
+          <span id="conn-state" class="pill">connecting</span>
+          <button id="logout-btn" type="button" class="ghost">Lock</button>
+        </div>
+      </header>
+
+      <div id="messages" class="messages" role="log" aria-live="polite"></div>
+
+      <form id="send-form" class="send" autocomplete="off">
+        <input id="message-input" type="text" maxlength="4000" placeholder="Type an encrypted message...">
+        <button id="send-btn" type="submit">Send</button>
+      </form>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
