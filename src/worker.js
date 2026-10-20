@@ -320,7 +320,10 @@ export class ChatRoomDO {
 		server.accept();
 
 		this.sessions.add(server);
-		server.addEventListener('close', () => this.sessions.delete(server));
+		server.addEventListener('close', () => {
+			this.sessions.delete(server);
+			this.broadcastPresence();
+		});
 		server.addEventListener('message', (event) => this.onClientMessage(server, event.data));
 
 		// Replay: either everything newer than the client's cursor, or the tail
@@ -334,7 +337,14 @@ export class ChatRoomDO {
 			// still receive live messages.
 		}
 
+		this.broadcastPresence();
 		return new Response(null, { status: 101, webSocket: client });
+	}
+
+	// How many browsers are currently attached to this room. Purely cosmetic —
+	// it carries no user data.
+	broadcastPresence() {
+		this.broadcast(JSON.stringify({ type: 'presence', online: this.sessions.size }));
 	}
 
 	broadcast(data) {

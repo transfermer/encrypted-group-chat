@@ -156,32 +156,41 @@ function wsConnect(cookie, path = '/api/ws') {
 
 	const b64 = (t) => Buffer.from(t).toString('base64');
 
+	// Control frames (presence / pong) share the socket with message rows.
+	const msgs = (frames) => frames.map((f) => JSON.parse(f)).filter((f) => f.type === undefined);
+	const ctrl = (frames) => frames.map((f) => JSON.parse(f)).filter((f) => f.type !== undefined);
+
 	// --- websocket: connect, receive replay + live broadcast ---
 	const ws = await wsConnect(cookie);
 	const post1 = await postMessage(cookie, b64('hello from smoke test'));
 	check('post message accepted', post1.status === 201, JSON.stringify(post1));
 	check('post returns id + seq', !!post1.body.id && Number.isInteger(post1.body.seq), JSON.stringify(post1.body));
 
-	let frames = await ws.waitFor(1);
-	check('websocket pushed the new message', frames.length >= 1 && JSON.parse(frames[0]).c === b64('hello from smoke test'), JSON.stringify(frames));
+	let frames = await ws.waitFor(2);
+	let rows = msgs(frames);
+	check('websocket pushed the new message', rows.length >= 1 && rows[0].c === b64('hello from smoke test'), JSON.stringify(frames));
+	check('presence frame reports the online count', ctrl(frames).some((f) => f.type === 'presence' && f.online >= 1), JSON.stringify(ctrl(frames)));
 
 	// ping → pong
 	ws.send(JSON.stringify({ type: 'ping' }));
-	frames = await ws.waitFor(2);
-	check('ping answered with pong', frames.length >= 2 && JSON.parse(frames[1]).type === 'pong', JSON.stringify(frames));
+	frames = await ws.waitFor(3);
+	check('ping answered with pong', ctrl(frames).some((f) => f.type === 'pong'), JSON.stringify(ctrl(frames)));
 
 	// second client gets the history replay
 	const ws2 = await wsConnect(cookie);
 	frames = await ws2.waitFor(1);
-	const replay = frames.map((f) => JSON.parse(f));
+	const replay = msgs(frames);
 	check('new client replays history', replay.length >= 1 && replay[0].c === b64('hello from smoke test'), JSON.stringify(replay));
+	check('second client sees the presence count rise', ctrl(frames).some((f) => f.type === 'presence' && f.online >= 2), JSON.stringify(ctrl(frames)));
 
 	// live broadcast reaches both
 	await postMessage(cookie, b64('second message'));
 	frames = await ws.waitFor(3);
-	check('broadcast reached client 1', frames.length >= 3 && JSON.parse(frames[2]).c === b64('second message'), JSON.stringify(frames));
+	rows = msgs(frames);
+	check('broadcast reached client 1', rows.length >= 2 && rows[rows.length - 1].c === b64('second message'), JSON.stringify(frames));
 	frames = await ws2.waitFor(2);
-	check('broadcast reached client 2', frames.length >= 2 && JSON.parse(frames[1]).c === b64('second message'), JSON.stringify(frames));
+	rows = msgs(frames);
+	check('broadcast reached client 2', rows.length >= 1 && rows[rows.length - 1].c === b64('second message'), JSON.stringify(frames));
 
 	// since cursor
 	const list = await getMessages(cookie);

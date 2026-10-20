@@ -56,18 +56,47 @@ The client de-duplicates on `id` and keeps a `seq` cursor. It never compares
 array lengths, and it reconnects with `?since=<seq>` so it only receives what it
 missed. The same `since` parameter works on `GET /api/messages`.
 
+## Interface
+
+The chat UI is a small design system rather than a pile of inline styles:
+
+- **Chat bubbles** — your own messages sit right, everyone else's left, so a
+  conversation is scannable at a glance. Avatars are generated from the display
+  name (initials + a stable colour per name).
+- **Message grouping** — consecutive messages from the same person within five
+  minutes collapse into one block, so the author name and timestamp are printed
+  once instead of on every line.
+- **Day separators** — "Today" / "Yesterday" / a date, inserted between days.
+- **Copy on hover** — every bubble has a copy button that puts the *decrypted*
+  text on the clipboard.
+- **Unread badge** — scroll up while you read and new messages are counted; a
+  floating "↓ N new" button jumps back to the tail.
+- **Composer** — a growing textarea: Enter sends, Shift+Enter inserts a newline,
+  and the IME composition state is respected so Chinese/Japanese input is never
+  sent half-finished. A character counter appears near the 4000-character limit.
+- **Presence** — the header shows how many browsers are attached to the room
+  (a cheap `presence` frame the Durable Object broadcasts on connect/disconnect).
+- **Light and dark themes** — every colour is a token; `light-dark()` follows
+  the OS preference and the header button overrides it (the choice is stored in
+  `localStorage`). No flash on load, no extra request.
+- **App-shell layout** — the header and composer are fixed while the message
+  list scrolls on its own, so the input is always reachable on a phone.
+- **Accessibility** — labelled controls, `aria-live` log, visible focus rings,
+  and `prefers-reduced-motion` support.
+
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `src/worker.js` | Worker API (auth, sessions) + `ChatRoomDO` + `LoginGuardDO` |
-| `public/index.html` | Login + chat UI (no inline JS, CSP) |
-| `public/app.js` | PBKDF2 → AES-256-GCM encryption + WebSocket client |
-| `public/style.css` | Dark themed styling |
+| `public/index.html` | Login + chat UI (no inline JS, CSP, SVG icon sprite) |
+| `public/app.js` | PBKDF2 → AES-256-GCM encryption + WebSocket client + rendering |
+| `public/style.css` | Design tokens, light/dark themes, chat layout |
 | `public/_headers` | Security headers (CSP, nosniff, etc.) |
 | `wrangler.jsonc` | Bindings + DO class exports (no secrets, no resource IDs) |
 | `.gitignore` | Keeps `wrangler.toml` local-only, ignores node_modules |
-| `tests/worker.test.mjs` | 24 tests (runs in plain Node, no account) |
+| `tests/worker.test.mjs` | 25 tests (runs in plain Node, no account) |
+| `tests/smoke.mjs` | End-to-end checks against a real `wrangler dev` runtime |
 
 ## Deploy to Cloudflare (step by step)
 
@@ -105,17 +134,21 @@ Dashboard → your Worker → Settings → Variables & Secrets → **PASSWORD** 
 npm test
 ```
 
-24 tests cover auth, sessions, message ordering, the `since` cursor, history
-trimming, WebSocket upgrades, broadcast fan-out, validation, rate limiting,
-CORS, and that the password is never exposed by any endpoint.
+25 tests cover auth, sessions, message ordering, the `since` cursor, history
+trimming, WebSocket upgrades, presence, broadcast fan-out, validation, rate
+limiting, CORS, and that the password is never exposed by any endpoint.
 
 There is also an end-to-end check against a real local runtime:
 
 ```bash
-npx wrangler dev --local --var PASSWORD:'test-pass' --var SESSION_SECRET:'test-secret'
+npx wrangler dev --local --port 8787 \
+  --var PASSWORD:'room-pass-123' --var SESSION_SECRET:'session-signing-secret-value'
 # then, from another shell:
 node tests/smoke.mjs        # real Durable Object, real SQLite, real WebSocket
 ```
+
+> The smoke test deliberately triggers the brute-force limiter, so run it
+> against a **fresh** `wrangler dev` (or restart the server between runs).
 
 ## Architecture
 

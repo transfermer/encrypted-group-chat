@@ -17,8 +17,12 @@ const APP_SALT = new TextEncoder().encode('encrypted-group-chat/v1');
 const PBKDF2_ITERATIONS = 200000;
 const IV_BYTES = 12;
 const NAME_KEY = 'egc.displayName';
+const THEME_KEY = 'egc.theme';
 const HEARTBEAT_MS = 30000; // keeps the socket honest without flooding requests
 const MAX_TRACKED_IDS = 2000; // bounded de-duplication window
+const GROUP_WINDOW_MS = 5 * 60 * 1000; // same author within this window → grouped
+const COUNTER_LIMIT = 3200; // show the character counter near the cap
+const MAX_TEXTAREA_H = 160;
 
 let cryptoKey = null; // AES-GCM CryptoKey, memory only — never persisted
 let displayName = '';
@@ -36,7 +40,40 @@ let lastTs = 0;
 const seenIds = new Set();
 const seenOrder = [];
 
+// Rendering state
+let lastRender = null; // { day, author, ts } — drives grouping + day separators
+let userScrolledUp = false; // true when the reader scrolled away from the tail
+let unread = 0;
+let scrollScheduled = false;
+let connState = { label: 'connecting', kind: '' };
+
 const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------------------
+// theme — applied before the first paint so there is no flash
+// ---------------------------------------------------------------------------
+(function initTheme() {
+	try {
+		const stored = localStorage.getItem(THEME_KEY);
+		if (stored === 'light' || stored === 'dark') document.documentElement.dataset.theme = stored;
+	} catch {
+		/* storage blocked — follow the OS preference */
+	}
+})();
+
+function toggleTheme() {
+	const root = document.documentElement;
+	const current = root.dataset.theme;
+	const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+	// Without an explicit choice, the first click flips away from the OS theme.
+	const next = current ? (current === 'light' ? 'dark' : 'light') : systemDark ? 'light' : 'dark';
+	root.dataset.theme = next;
+	try {
+		localStorage.setItem(THEME_KEY, next);
+	} catch {
+		/* storage blocked — the theme still applies for this session */
+	}
+}
 
 // ---------------------------------------------------------------------------
 // crypto
@@ -106,13 +143,8 @@ const postJson = (path, payload) =>
 	api(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
 
 // ---------------------------------------------------------------------------
-// ui
+// small helpers
 // ---------------------------------------------------------------------------
-
-function show(view) {
-	$('login-view').classList.toggle('hidden', view !== 'login');
-	$('chat-view').classList.toggle('hidden', view !== 'chat');
-}
 
 function setLoginStatus(message, kind = '') {
 	const el = $('login-status');
@@ -121,53 +153,241 @@ function setLoginStatus(message, kind = '') {
 }
 
 function setConnState(label, kind = '') {
-	const el = $('conn-state');
-	el.textContent = label;
-	el.className = `pill ${kind}`.trim();
+	connState = { label, kind };
+	$('conn-text').textContent = label;
+	$('conn-state').className = `pill ${kind}`.trim();
 }
 
-function addMessageEl({ name, text, ts, mine, failed }) {
-	const wrap = document.createElement('div');
-	wrap.className = `msg${mine ? ' mine' : ''}${failed ? ' failed' : ''}`;
-
-	const meta = document.createElement('div');
-	meta.className = 'msg-meta';
-
-	const nameEl = document.createElement('span');
-	nameEl.className = 'msg-name';
-	nameEl.textContent = name;
-
-	const timeEl = document.createElement('span');
-	timeEl.className = 'msg-time';
-	timeEl.textContent = ts ? new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-
-	meta.append(nameEl, timeEl);
-
-	const bodyEl = document.createElement('div');
-	bodyEl.className = 'msg-body';
-	bodyEl.textContent = text; // textContent, never innerHTML — user content can't inject markup
-
-	wrap.append(meta, bodyEl);
-	$('messages').appendChild(wrap);
+// Briefly show a transient state (e.g. "send failed") then fall back.
+function flashConnState(label, kind, ms = 2600) {
+	const prev = connState;
+	setConnState(label, kind);
+	setTimeout(() => {
+		if (connState.label === label) setConnState(prev.label, prev.kind);
+	}, ms);
 }
+
+function updateOnline(n) {
+	const el = $('online-count');
+	if (typeof n !== 'number' || n < 0) {
+		el.textContent = '—';
+		return;
+	}
+	// Counts live connections (one per open tab), not deduplicated people.
+	el.textContent = n === 1 ? '1 online' : `${n} online`;
+}
+
+function initials(name) {
+	const parts = String(name).trim().split(/\s+/).filter(Boolean);
+	if (!parts.length) return '?';
+	if (parts.length === 1) return Array.from(parts[0]).slice(0, 2).join('').toUpperCase();
+	const first = Array.from(parts[0])[0] || '';
+	const last = Array.from(parts[parts.length - 1])[0] || '';
+	return (first + last).toUpperCase();
+}
+
+// Stable per-name colour so the same person always gets the same avatar hue.
+function hueOf(name) {
+	let h = 0;
+	for (const ch of String(name)) h = (h * 31 + (ch.codePointAt(0) || 0)) % 9973;
+	return h % 6;
+}
+
+function dayKey(ts) {
+	const d = new Date(ts);
+	return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
+
+function dayLabel(ts) {
+	const d = new Date(ts);
+	const now = new Date();
+	const yesterday = new Date(now.getTime() - 86400000);
+	if (dayKey(ts) === dayKey(now.getTime())) return 'Today';
+	if (dayKey(ts) === dayKey(yesterday.getTime())) return 'Yesterday';
+	const opts = { month: 'short', day: 'numeric' };
+	if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
+	return d.toLocaleDateString([], opts);
+}
+
+function timeLabel(ts) {
+	return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+// ---------------------------------------------------------------------------
+// message rendering
+// ---------------------------------------------------------------------------
 
 function clearEmptyState() {
 	const box = $('messages');
-	if (box.querySelector('.empty')) box.textContent = '';
+	const empty = box.querySelector('.empty');
+	if (empty) empty.remove();
 }
 
 function renderEmpty() {
 	const box = $('messages');
 	box.textContent = '';
-	const p = document.createElement('p');
-	p.className = 'empty';
-	p.textContent = 'No messages yet. Say something — it will be encrypted before it leaves your browser.';
-	box.appendChild(p);
+	box.appendChild($('tpl-empty').content.cloneNode(true));
 }
 
-function scrollToBottom() {
+function isAtBottom() {
 	const box = $('messages');
+	return box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+}
+
+function scheduleScroll() {
+	const box = $('messages');
+	// Scroll immediately: requestAnimationFrame is throttled in background
+	// tabs, which would otherwise leave the reader stranded mid-history.
 	box.scrollTop = box.scrollHeight;
+	if (scrollScheduled) return;
+	scrollScheduled = true;
+	requestAnimationFrame(() => {
+		scrollScheduled = false;
+		box.scrollTop = box.scrollHeight;
+	});
+}
+
+function bumpUnread() {
+	unread += 1;
+	updateJump();
+}
+
+function updateJump() {
+	const btn = $('jump-latest');
+	if (unread > 0) {
+		btn.classList.remove('hidden');
+		$('unread-label').textContent = unread > 99 ? '99+ new' : `${unread} new`;
+	} else {
+		btn.classList.add('hidden');
+	}
+}
+
+function daySeparator(label) {
+	const sep = document.createElement('div');
+	sep.className = 'day-sep';
+	const span = document.createElement('span');
+	span.textContent = label;
+	sep.appendChild(span);
+	return sep;
+}
+
+function messageRow({ author, text, ts, mine, grouped }) {
+	const row = document.createElement('div');
+	row.className = `row${mine ? ' mine' : ''}${grouped ? ' grouped' : ''}`;
+
+	// Grouped messages drop the avatar, but the grid keeps the text aligned.
+	if (!grouped) {
+		const avatar = document.createElement('div');
+		avatar.className = `avatar hue-${hueOf(author)}`;
+		avatar.textContent = initials(author);
+		avatar.setAttribute('aria-hidden', 'true');
+		row.appendChild(avatar);
+	}
+
+	const wrap = document.createElement('div');
+	wrap.className = 'msg-wrap';
+
+	if (!grouped) {
+		const head = document.createElement('div');
+		head.className = 'msg-head';
+
+		const name = document.createElement('span');
+		name.className = 'msg-name';
+		name.textContent = author;
+
+		const time = document.createElement('time');
+		time.className = 'msg-time';
+		const d = new Date(ts);
+		time.dateTime = d.toISOString();
+		time.textContent = timeLabel(ts);
+		time.title = d.toLocaleString();
+
+		head.append(name, time);
+		wrap.appendChild(head);
+	}
+
+	const bubbleWrap = document.createElement('div');
+	bubbleWrap.className = 'bubble-wrap';
+
+	const bubble = document.createElement('div');
+	bubble.className = 'bubble';
+	bubble.textContent = text; // textContent, never innerHTML — user content can't inject markup
+	bubbleWrap.appendChild(bubble);
+
+	const copy = $('tpl-copy').content.firstElementChild.cloneNode(true);
+	copy.addEventListener('click', () => copyMessage(text, copy));
+	bubbleWrap.appendChild(copy);
+
+	wrap.appendChild(bubbleWrap);
+	row.appendChild(wrap);
+	return row;
+}
+
+async function copyMessage(text, btn) {
+	try {
+		await navigator.clipboard.writeText(text);
+		const use = btn.querySelector('use');
+		if (use) use.setAttribute('href', '#i-check');
+		btn.classList.add('done');
+		setTimeout(() => {
+			if (use) use.setAttribute('href', '#i-copy');
+			btn.classList.remove('done');
+		}, 1400);
+	} catch {
+		flashConnState('copy failed', 'error');
+	}
+}
+
+function renderPayload(payload, ts) {
+	const author = typeof payload.n === 'string' && payload.n ? payload.n : 'anon';
+	const text = typeof payload.m === 'string' ? payload.m : '';
+	const mine = payload.n === displayName;
+	const day = dayKey(ts);
+
+	const box = $('messages');
+	clearEmptyState();
+
+	if (!lastRender || lastRender.day !== day) {
+		box.appendChild(daySeparator(dayLabel(ts)));
+		lastRender = { day, author: null, ts: 0 };
+	}
+	const grouped = lastRender.author === author && Math.abs(ts - lastRender.ts) < GROUP_WINDOW_MS;
+
+	box.appendChild(messageRow({ author, text, ts, mine, grouped }));
+	lastRender = { day, author, ts };
+
+	if (userScrolledUp) bumpUnread();
+	else scheduleScroll();
+}
+
+// A row pushed over the WebSocket, or replayed from history on connect.
+async function handleIncoming(row) {
+	if (!row || typeof row !== 'object') return;
+	if (row.type === 'pong') return;
+	if (row.type === 'presence') {
+		updateOnline(row.online);
+		return;
+	}
+	if (typeof row.id !== 'string') return;
+	if (!markSeen(row.id)) return; // already rendered — the id is the source of truth
+	advanceCursor(row);
+
+	try {
+		const payload = await decryptPayload(row.c);
+		renderPayload(payload, row.t);
+	} catch {
+		clearEmptyState();
+		const box = $('messages');
+		box.appendChild(messageRow({
+			author: '?',
+			text: '[could not decrypt — different room password?]',
+			ts: row.t,
+			mine: false,
+			grouped: false,
+		}));
+		if (userScrolledUp) bumpUnread();
+		else scheduleScroll();
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -190,42 +410,6 @@ function markSeen(id) {
 function advanceCursor(row) {
 	if (Number.isFinite(row.seq) && row.seq > lastSeq) lastSeq = row.seq;
 	if (Number.isFinite(row.t) && row.t > lastTs) lastTs = row.t;
-}
-
-function renderPayload(payload, ts) {
-	clearEmptyState();
-	addMessageEl({
-		name: typeof payload.n === 'string' && payload.n ? payload.n : 'anon',
-		text: typeof payload.m === 'string' ? payload.m : '',
-		ts,
-		mine: payload.n === displayName,
-		failed: false,
-	});
-	scrollToBottom();
-}
-
-// A row pushed over the WebSocket, or replayed from history on connect.
-async function handleIncoming(row) {
-	if (!row || typeof row !== 'object') return;
-	if (row.type === 'pong') return;
-	if (typeof row.id !== 'string') return;
-	if (!markSeen(row.id)) return; // already rendered — the id is the source of truth
-	advanceCursor(row);
-
-	try {
-		const payload = await decryptPayload(row.c);
-		renderPayload(payload, row.t);
-	} catch {
-		clearEmptyState();
-		addMessageEl({
-			name: '?',
-			text: '[could not decrypt — different room password?]',
-			ts: row.t,
-			mine: false,
-			failed: true,
-		});
-		scrollToBottom();
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +451,7 @@ function connect() {
 		stopHeartbeat();
 		socket = null;
 		if (!cryptoKey) return;
-		setConnState('reconnecting', 'error');
+		setConnState('reconnecting', 'busy');
 		scheduleReconnect();
 	};
 
@@ -338,11 +522,36 @@ function lock(message) {
 	lastTs = 0;
 	seenIds.clear();
 	seenOrder.length = 0;
+	lastRender = null;
+	unread = 0;
+	userScrolledUp = false;
 	$('messages').textContent = '';
 	show('login');
 	$('login-btn').disabled = false;
-	$('login-btn').textContent = 'Unlock';
+	$('login-btn-text').textContent = 'Unlock room';
+	setConnState('connecting');
 	setLoginStatus(message || '', message ? 'error' : '');
+}
+
+// ---------------------------------------------------------------------------
+// composer
+// ---------------------------------------------------------------------------
+
+function autoGrow() {
+	const el = $('message-input');
+	el.style.height = 'auto';
+	el.style.height = Math.min(el.scrollHeight, MAX_TEXTAREA_H) + 'px';
+}
+
+function updateCounter() {
+	const len = $('message-input').value.length;
+	const el = $('char-count');
+	el.textContent = len > COUNTER_LIMIT ? `${len} / 4000` : '';
+	el.classList.toggle('warn', len > 3800);
+}
+
+function updateSendState() {
+	$('send-btn').disabled = $('message-input').value.trim() === '';
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +573,7 @@ async function handleLogin(event) {
 	}
 
 	button.disabled = true;
-	button.textContent = 'Deriving key...';
+	$('login-btn-text').textContent = 'Deriving key…';
 	setLoginStatus('', '');
 
 	try {
@@ -392,6 +601,9 @@ async function handleLogin(event) {
 		lastTs = 0;
 		seenIds.clear();
 		seenOrder.length = 0;
+		lastRender = null;
+		unread = 0;
+		userScrolledUp = false;
 		renderEmpty();
 
 		show('chat');
@@ -403,7 +615,7 @@ async function handleLogin(event) {
 		cryptoKey = null;
 	} finally {
 		button.disabled = false;
-		button.textContent = 'Unlock';
+		$('login-btn-text').textContent = 'Unlock room';
 	}
 }
 
@@ -428,11 +640,14 @@ async function handleSend(event) {
 			return;
 		}
 		if (!ok) {
-			setConnState('send failed', 'error');
+			flashConnState('send failed', 'error');
 			return;
 		}
 
 		input.value = '';
+		autoGrow();
+		updateCounter();
+		updateSendState();
 
 		// The server echoes the stored row back over the WebSocket. If that
 		// echo has not arrived yet, render locally — the message id makes the
@@ -442,11 +657,11 @@ async function handleSend(event) {
 			renderPayload(payload, body.t);
 		}
 	} catch (err) {
-		setConnState('error', 'error');
+		flashConnState('send failed', 'error');
 		console.error('send failed', err);
 	} finally {
 		sending = false;
-		$('send-btn').disabled = false;
+		updateSendState();
 	}
 }
 
@@ -459,20 +674,60 @@ async function handleLogout() {
 // boot
 // ---------------------------------------------------------------------------
 
-document.addEventListener('DOMContentLoaded', () => {
+function show(view) {
+	$('login-view').classList.toggle('hidden', view !== 'login');
+	$('chat-view').classList.toggle('hidden', view !== 'chat');
+}
+
+function boot() {
 	$('name-input').value = sessionStorage.getItem(NAME_KEY) || '';
 	$('login-form').addEventListener('submit', handleLogin);
 	$('send-form').addEventListener('submit', handleSend);
 	$('logout-btn').addEventListener('click', handleLogout);
-	$('message-input').addEventListener('keydown', (e) => {
-		if (e.key === 'Enter' && !e.shiftKey) handleSend(e);
+	$('theme-btn').addEventListener('click', toggleTheme);
+	$('jump-latest').addEventListener('click', () => {
+		unread = 0;
+		updateJump();
+		userScrolledUp = false;
+		scheduleScroll();
+	});
+
+	const input = $('message-input');
+	input.addEventListener('input', () => {
+		autoGrow();
+		updateCounter();
+		updateSendState();
+	});
+	input.addEventListener('keydown', (e) => {
+		// Ignore Enter while an IME is composing — otherwise Chinese/Japanese
+		// input would send the message mid-composition.
+		if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+			e.preventDefault();
+			handleSend(e);
+		}
+	});
+
+	$('messages').addEventListener('scroll', () => {
+		userScrolledUp = !isAtBottom();
+		if (!userScrolledUp) {
+			unread = 0;
+			updateJump();
+		}
 	});
 
 	show('login');
+	updateSendState();
+
 	// Ask the Worker whether config is complete so setup problems are obvious.
 	api('/api/health').then(({ body }) => {
 		if (body && body.ok === false) {
 			setLoginStatus(`Server needs setup — missing: ${(body.missing || []).join(', ')}`, 'error');
 		}
 	}).catch(() => {});
-});
+}
+
+if (document.readyState === 'loading') {
+	document.addEventListener('DOMContentLoaded', boot);
+} else {
+	boot();
+}

@@ -436,7 +436,8 @@ test('an authenticated websocket upgrade replays the history', async () => {
 	});
 	assert.equal(sockets.length, 1);
 	assert.equal(sockets[0].accepted, true, 'the server socket must be accepted');
-	const frames = sockets[0].sent.map((s) => JSON.parse(s));
+	// the socket also receives a presence frame — only count message rows here
+	const frames = sockets[0].sent.map((s) => JSON.parse(s)).filter((f) => f.type === undefined);
 	assert.equal(frames.length, 1);
 	assert.equal(frames[0].c, b64('old'));
 	assert.ok(frames[0].id && frames[0].seq, 'replayed rows carry id + seq');
@@ -455,7 +456,7 @@ test('a websocket upgrade with since only replays newer messages', async () => {
 		const res = await call(env, `/api/ws?since=${first.json.seq}`, { cookie, headers: { upgrade: 'websocket' } });
 		assert.equal(res.status, 101);
 	});
-	const frames = sockets[0].sent.map((s) => JSON.parse(s));
+	const frames = sockets[0].sent.map((s) => JSON.parse(s)).filter((f) => f.type === undefined);
 	assert.equal(frames.length, 1);
 	assert.equal(frames[0].c, b64('new'));
 });
@@ -494,8 +495,40 @@ test('ping frames are answered with a pong', async () => {
 		sockets[0].emit('message', { data: JSON.stringify({ type: 'ping' }) });
 	});
 	const frames = sockets[0].sent.map((s) => JSON.parse(s));
-	assert.equal(frames.length, 1);
-	assert.equal(frames[0].type, 'pong');
+	const pongs = frames.filter((f) => f.type === 'pong');
+	assert.equal(pongs.length, 1, 'exactly one pong');
+});
+
+test('presence is broadcast on connect and on disconnect', async () => {
+	const env = makeEnv();
+	const login = await call(env, '/api/login', { method: 'POST', body: { password: PASSWORD } });
+	const cookie = cookieFrom(login);
+
+	let sockets = [];
+	await withFakeWebSocketPair(async (created) => {
+		sockets = created;
+		await call(env, '/api/ws', { cookie, headers: { upgrade: 'websocket' } });
+	});
+	const presenceOf = (list) => list.map((s) => JSON.parse(s)).filter((f) => f.type === 'presence');
+
+	let first = presenceOf(sockets[0].sent);
+	assert.equal(first.length, 1, 'the connecting client is told how many are online');
+	assert.equal(first[0].online, 1);
+
+	// a second client joins → the first one is told
+	let sockets2 = [];
+	await withFakeWebSocketPair(async (created) => {
+		sockets2 = created;
+		await call(env, '/api/ws', { cookie, headers: { upgrade: 'websocket' } });
+	});
+	const afterJoin = presenceOf(sockets[0].sent);
+	assert.equal(afterJoin[afterJoin.length - 1].online, 2, 'the first client sees the count rise');
+	assert.equal(presenceOf(sockets2[0].sent)[0].online, 2, 'the new client sees the current count');
+
+	// ... and leaves again
+	sockets2[0].emit('close');
+	const afterLeave = presenceOf(sockets[0].sent);
+	assert.equal(afterLeave[afterLeave.length - 1].online, 1, 'the count drops on disconnect');
 });
 
 // --- brute force protection ----------------------------------------------

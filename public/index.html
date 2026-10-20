@@ -2,53 +2,138 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="Password-gated, end-to-end encrypted group chat.">
   <title>Encrypted Group Chat</title>
   <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
 </head>
 <body>
-  <main class="shell">
-    <!-- Login / unlock -->
-    <section id="login-view" class="card">
-      <h1>&#128274; Encrypted Group Chat</h1>
-      <p class="hint">Enter the room password to unlock the full chat history.</p>
+  <!-- icon sprite (referenced with <use href="#…">) -->
+  <svg class="sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="4" y="10" width="16" height="11" rx="2.5"></rect>
+      <path d="M8 10V7a4 4 0 0 1 8 0v3"></path>
+      <circle cx="12" cy="15.5" r="1.4" fill="currentColor" stroke="none"></circle>
+    </symbol>
+    <symbol id="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 19V5"></path>
+      <path d="m5 12 7-7 7 7"></path>
+    </symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="9" y="9" width="11" height="11" rx="2.2"></rect>
+      <path d="M5 15V6a2 2 0 0 1 2-2h9"></path>
+    </symbol>
+    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="m4 12.5 5 5L20 6.5"></path>
+    </symbol>
+    <symbol id="i-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 5v14"></path>
+      <path d="m5 12 7 7 7-7"></path>
+    </symbol>
+    <symbol id="i-theme" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="8"></circle>
+      <path d="M12 4v16" fill="currentColor" stroke="none"></path>
+      <path d="M12 4a8 8 0 0 1 0 16" fill="currentColor" stroke="none" opacity=".45"></path>
+    </symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 3 5 6v5.5c0 4.3 2.9 8.2 7 9.5 4.1-1.3 7-5.2 7-9.5V6l-7-3Z"></path>
+      <path d="m9 12 2 2 4-4"></path>
+    </symbol>
+  </svg>
 
-      <form id="login-form" autocomplete="off">
-        <label for="name-input">Display name</label>
-        <input id="name-input" type="text" maxlength="32" placeholder="e.g. Alice" autocomplete="nickname">
+  <main class="app">
+    <!-- ── Unlock ─────────────────────────────────────────────── -->
+    <section id="login-view" class="login">
+      <div class="login-card">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg class="icon" aria-hidden="true"><use href="#i-lock"></use></svg>
+          </span>
+          <div class="brand-text">
+            <h1>Encrypted Group Chat</h1>
+            <p>End&#8209;to&#8209;end encrypted — the server only ever stores ciphertext.</p>
+          </div>
+        </div>
 
-        <label for="password-input">Room password</label>
-        <input id="password-input" type="password" placeholder="Password" autocomplete="current-password" required>
+        <form id="login-form" class="login-form" autocomplete="off">
+          <label for="name-input">Display name</label>
+          <input id="name-input" type="text" maxlength="32" placeholder="e.g. Alice" autocomplete="nickname" spellcheck="false">
 
-        <button id="login-btn" type="submit">Unlock</button>
-      </form>
+          <label for="password-input">Room password</label>
+          <input id="password-input" type="password" placeholder="••••••••" autocomplete="current-password" required>
 
-      <p id="login-status" class="status" role="status" aria-live="polite"></p>
-      <p class="fineprint">
-        Messages are encrypted in your browser with AES-256-GCM before upload.
-        The server stores ciphertext only and never sees the key.
-      </p>
+          <button id="login-btn" type="submit" class="btn btn-primary btn-block">
+            <span id="login-btn-text">Unlock room</span>
+          </button>
+        </form>
+
+        <p id="login-status" class="status" role="status" aria-live="polite"></p>
+
+        <dl class="facts">
+          <div class="fact"><dt>Encryption</dt><dd>AES-256-GCM, in your browser</dd></div>
+          <div class="fact"><dt>Transport</dt><dd>Durable Object + WebSocket</dd></div>
+          <div class="fact"><dt>Server sees</dt><dd>ciphertext only</dd></div>
+        </dl>
+      </div>
     </section>
 
-    <!-- Chat -->
-    <section id="chat-view" class="card hidden">
+    <!-- ── Chat ───────────────────────────────────────────────── -->
+    <section id="chat-view" class="chat hidden">
       <header class="chat-head">
-        <h1>&#128172; <span id="room-title">Chat</span></h1>
-        <div class="chat-head-actions">
-          <span id="conn-state" class="pill">connecting</span>
-          <button id="logout-btn" type="button" class="ghost">Lock</button>
+        <div class="chat-id">
+          <h1 id="room-title">Encrypted Chat</h1>
+          <p class="chat-sub"><span id="online-count" class="online">connecting…</span></p>
+        </div>
+        <div class="chat-actions">
+          <span id="conn-state" class="pill" role="status" aria-live="polite">
+            <i class="dot" aria-hidden="true"></i><span id="conn-text">connecting</span>
+          </span>
+          <button id="theme-btn" class="icon-btn" type="button" aria-label="Switch colour theme" title="Switch colour theme">
+            <svg class="icon" aria-hidden="true"><use href="#i-theme"></use></svg>
+          </button>
+          <button id="logout-btn" class="icon-btn" type="button" aria-label="Lock the room" title="Lock the room">
+            <svg class="icon" aria-hidden="true"><use href="#i-lock"></use></svg>
+          </button>
         </div>
       </header>
 
-      <div id="messages" class="messages" role="log" aria-live="polite"></div>
+      <div class="messages-wrap">
+        <div id="messages" class="messages" role="log" aria-live="polite" aria-relevant="additions"></div>
+        <button id="jump-latest" class="jump hidden" type="button" aria-label="Jump to the latest message">
+          <svg class="icon" aria-hidden="true"><use href="#i-down"></use></svg>
+          <span id="unread-label">new</span>
+        </button>
+      </div>
 
-      <form id="send-form" class="send" autocomplete="off">
-        <input id="message-input" type="text" maxlength="4000" placeholder="Type an encrypted message...">
-        <button id="send-btn" type="submit">Send</button>
+      <form id="send-form" class="composer" autocomplete="off">
+        <div class="composer-box">
+          <label class="sr-only" for="message-input">Message</label>
+          <textarea id="message-input" rows="1" maxlength="4000" placeholder="Write an encrypted message…" spellcheck="true"></textarea>
+          <button id="send-btn" type="submit" class="btn btn-send" aria-label="Send message">
+            <svg class="icon" aria-hidden="true"><use href="#i-send"></use></svg>
+          </button>
+        </div>
+        <div class="composer-foot">
+          <span class="hint">Enter to send · Shift+Enter for a new line</span>
+          <span id="char-count" class="counter"></span>
+        </div>
       </form>
     </section>
   </main>
 
-  <script src="/app.js"></script>
+  <template id="tpl-copy">
+    <button class="copy-btn" type="button" aria-label="Copy message" title="Copy message">
+      <svg class="icon" aria-hidden="true"><use href="#i-copy"></use></svg>
+    </button>
+  </template>
+
+  <template id="tpl-empty">
+    <div class="empty">
+      <svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>
+      <p>No messages yet. Anything you type is encrypted before it leaves this browser.</p>
+    </div>
+  </template>
 </body>
 </html>
