@@ -11,11 +11,28 @@
 			"/api/*"
 		]
 	},
-	"kv_namespaces": [
-		{
-			"binding": "CHAT_KV"
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "CHAT_ROOM",
+				"class_name": "ChatRoomDO"
+			},
+			{
+				"name": "LOGIN_GUARD",
+				"class_name": "LoginGuardDO"
+			}
+		]
+	},
+	"exports": {
+		"ChatRoomDO": {
+			"type": "durable-object",
+			"storage": "sqlite"
+		},
+		"LoginGuardDO": {
+			"type": "durable-object",
+			"storage": "sqlite"
 		}
-	],
+	},
 	"observability": {
 		"enabled": true
 	}

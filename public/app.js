@@ -2,23 +2,39 @@
 //
 // The room password is turned into an AES-256-GCM key with PBKDF2 *in this
 // browser*. Every message (author name + text) is encrypted before it leaves
-// the device, so the Worker/KV only ever stores ciphertext.
+// the device, so the Worker/Durable Object only ever stores ciphertext.
 //
 // The password is POSTed once to /api/login over HTTPS purely for
 // authentication (the Worker compares SHA-256 digests). No endpoint ever
 // returns the password back to the client.
+//
+// TRANSPORT
+//   New messages arrive by WebSocket push (/api/ws) — no polling. The server
+//   assigns every message a monotonic `seq` and a UUID `id`; this client uses
+//   those keys to recognise new messages instead of comparing array lengths.
 
 const APP_SALT = new TextEncoder().encode('encrypted-group-chat/v1');
 const PBKDF2_ITERATIONS = 200000;
 const IV_BYTES = 12;
-const POLL_MS = 3000;
 const NAME_KEY = 'egc.displayName';
+const HEARTBEAT_MS = 30000; // keeps the socket honest without flooding requests
+const MAX_TRACKED_IDS = 2000; // bounded de-duplication window
 
 let cryptoKey = null; // AES-GCM CryptoKey, memory only — never persisted
 let displayName = '';
-let renderedCount = 0;
-let pollTimer = null;
 let sending = false;
+
+let socket = null;
+let reconnectTimer = null;
+let heartbeatTimer = null;
+let reconnectDelay = 1000;
+
+// Cursor into the server's message sequence. `seq` is the exact catch-up key,
+// `id` is the stable de-duplication key.
+let lastSeq = 0;
+let lastTs = 0;
+const seenIds = new Set();
+const seenOrder = [];
 
 const $ = (id) => document.getElementById(id);
 
@@ -135,6 +151,11 @@ function addMessageEl({ name, text, ts, mine, failed }) {
 	$('messages').appendChild(wrap);
 }
 
+function clearEmptyState() {
+	const box = $('messages');
+	if (box.querySelector('.empty')) box.textContent = '';
+}
+
 function renderEmpty() {
 	const box = $('messages');
 	box.textContent = '';
@@ -144,71 +165,184 @@ function renderEmpty() {
 	box.appendChild(p);
 }
 
-async function renderMessages(messages) {
+function scrollToBottom() {
 	const box = $('messages');
-	if (!messages.length) {
-		if (!renderedCount) renderEmpty();
-		return;
-	}
-	if (box.querySelector('.empty')) box.textContent = '';
-
-	for (const msg of messages.slice(renderedCount)) {
-		try {
-			const payload = await decryptPayload(msg.c);
-			addMessageEl({
-				name: typeof payload.n === 'string' && payload.n ? payload.n : 'anon',
-				text: typeof payload.m === 'string' ? payload.m : '',
-				ts: msg.t,
-				mine: payload.n === displayName,
-				failed: false,
-			});
-		} catch {
-			addMessageEl({ name: '?', text: '[could not decrypt — different room password?]', ts: msg.t, mine: false, failed: true });
-		}
-	}
-
-	renderedCount = messages.length;
 	box.scrollTop = box.scrollHeight;
 }
 
-async function refreshMessages() {
+// ---------------------------------------------------------------------------
+// message bookkeeping
+// ---------------------------------------------------------------------------
+
+// Returns true the first time an id is seen, false for duplicates.
+function markSeen(id) {
+	if (typeof id !== 'string' || !id) return false;
+	if (seenIds.has(id)) return false;
+	seenIds.add(id);
+	seenOrder.push(id);
+	if (seenOrder.length > MAX_TRACKED_IDS) {
+		const oldest = seenOrder.shift();
+		seenIds.delete(oldest);
+	}
+	return true;
+}
+
+function advanceCursor(row) {
+	if (Number.isFinite(row.seq) && row.seq > lastSeq) lastSeq = row.seq;
+	if (Number.isFinite(row.t) && row.t > lastTs) lastTs = row.t;
+}
+
+function renderPayload(payload, ts) {
+	clearEmptyState();
+	addMessageEl({
+		name: typeof payload.n === 'string' && payload.n ? payload.n : 'anon',
+		text: typeof payload.m === 'string' ? payload.m : '',
+		ts,
+		mine: payload.n === displayName,
+		failed: false,
+	});
+	scrollToBottom();
+}
+
+// A row pushed over the WebSocket, or replayed from history on connect.
+async function handleIncoming(row) {
+	if (!row || typeof row !== 'object') return;
+	if (row.type === 'pong') return;
+	if (typeof row.id !== 'string') return;
+	if (!markSeen(row.id)) return; // already rendered — the id is the source of truth
+	advanceCursor(row);
+
+	try {
+		const payload = await decryptPayload(row.c);
+		renderPayload(payload, row.t);
+	} catch {
+		clearEmptyState();
+		addMessageEl({
+			name: '?',
+			text: '[could not decrypt — different room password?]',
+			ts: row.t,
+			mine: false,
+			failed: true,
+		});
+		scrollToBottom();
+	}
+}
+
+// ---------------------------------------------------------------------------
+// websocket transport
+// ---------------------------------------------------------------------------
+
+function connect() {
 	if (!cryptoKey) return;
-	const { status, ok, body } = await api('/api/messages');
+	if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
 
-	if (status === 401) {
-		lock('Session expired — unlock again.');
+	const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+	// `since` lets the server replay only what we missed while disconnected.
+	const query = lastSeq > 0 ? `?since=${lastSeq}` : '';
+
+	try {
+		socket = new WebSocket(`${proto}//${location.host}/api/ws${query}`);
+	} catch {
+		scheduleReconnect();
 		return;
 	}
-	if (!ok) {
-		setConnState('error', 'error');
-		return;
-	}
 
-	setConnState('live', 'live');
-	await renderMessages(Array.isArray(body.messages) ? body.messages : []);
+	socket.onopen = () => {
+		setConnState('live', 'live');
+		reconnectDelay = 1000;
+		startHeartbeat();
+	};
+
+	socket.onmessage = (event) => {
+		let row;
+		try {
+			row = JSON.parse(event.data);
+		} catch {
+			return;
+		}
+		handleIncoming(row);
+	};
+
+	socket.onclose = () => {
+		stopHeartbeat();
+		socket = null;
+		if (!cryptoKey) return;
+		setConnState('reconnecting', 'error');
+		scheduleReconnect();
+	};
+
+	socket.onerror = () => {
+		// onclose always follows; nothing to do here.
+	};
+}
+
+function scheduleReconnect() {
+	clearTimeout(reconnectTimer);
+	const delay = reconnectDelay;
+	reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+	reconnectTimer = setTimeout(async () => {
+		if (!cryptoKey) return;
+		// A rejected session must not turn into an endless reconnect loop — but a
+		// temporarily unreachable server must not log the user out either.
+		let session = null;
+		try {
+			session = await api('/api/session');
+		} catch {
+			scheduleReconnect();
+			return;
+		}
+		if (!session.body || session.body.ok !== true) {
+			lock('Session expired — unlock again.');
+			return;
+		}
+		connect();
+	}, delay);
+}
+
+function startHeartbeat() {
+	stopHeartbeat();
+	heartbeatTimer = setInterval(() => {
+		if (socket && socket.readyState === WebSocket.OPEN) {
+			try {
+				socket.send(JSON.stringify({ type: 'ping' }));
+			} catch {
+				/* the close handler takes over */
+			}
+		}
+	}, HEARTBEAT_MS);
+}
+
+function stopHeartbeat() {
+	if (heartbeatTimer) clearInterval(heartbeatTimer);
+	heartbeatTimer = null;
+}
+
+function closeSocket() {
+	clearTimeout(reconnectTimer);
+	reconnectTimer = null;
+	stopHeartbeat();
+	if (socket) {
+		try {
+			socket.close();
+		} catch {
+			/* already closing */
+		}
+	}
+	socket = null;
 }
 
 function lock(message) {
 	cryptoKey = null;
-	renderedCount = 0;
+	closeSocket();
+	lastSeq = 0;
+	lastTs = 0;
+	seenIds.clear();
+	seenOrder.length = 0;
 	$('messages').textContent = '';
-	stopPolling();
 	show('login');
 	$('login-btn').disabled = false;
 	$('login-btn').textContent = 'Unlock';
 	setLoginStatus(message || '', message ? 'error' : '');
-}
-
-function startPolling() {
-	stopPolling();
-	pollTimer = setInterval(() => {
-		refreshMessages().catch(() => setConnState('offline', 'error'));
-	}, POLL_MS);
-}
-
-function stopPolling() {
-	if (pollTimer) clearInterval(pollTimer);
-	pollTimer = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -254,12 +388,15 @@ async function handleLogin(event) {
 		// Never keep the password in the DOM or in memory longer than needed.
 		passwordInput.value = '';
 
-		renderedCount = 0;
-		$('messages').textContent = '';
+		lastSeq = 0;
+		lastTs = 0;
+		seenIds.clear();
+		seenOrder.length = 0;
+		renderEmpty();
+
 		show('chat');
-		setConnState('loading');
-		await refreshMessages();
-		startPolling();
+		setConnState('connecting');
+		connect();
 		$('message-input').focus();
 	} catch (err) {
 		setLoginStatus(err.message || 'Login failed.', 'error');
@@ -282,8 +419,9 @@ async function handleSend(event) {
 	$('send-btn').disabled = true;
 
 	try {
-		const content = await encryptPayload({ n: displayName, m: text });
-		const { ok, status } = await postJson('/api/messages', { content });
+		const payload = { n: displayName, m: text };
+		const content = await encryptPayload(payload);
+		const { ok, status, body } = await postJson('/api/messages', { content });
 
 		if (status === 401) {
 			lock('Session expired — unlock again.');
@@ -295,7 +433,14 @@ async function handleSend(event) {
 		}
 
 		input.value = '';
-		await refreshMessages();
+
+		// The server echoes the stored row back over the WebSocket. If that
+		// echo has not arrived yet, render locally — the message id makes the
+		// two paths mutually exclusive.
+		if (body && typeof body.id === 'string' && markSeen(body.id)) {
+			advanceCursor(body);
+			renderPayload(payload, body.t);
+		}
 	} catch (err) {
 		setConnState('error', 'error');
 		console.error('send failed', err);

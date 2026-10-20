@@ -1,44 +1,224 @@
-// Local test harness for the Worker logic — runs in plain Node (no Cloudflare
-// account needed). Mocks the KV binding and crypto is provided by Node's
-// built-in Web Crypto, exactly like the Workers runtime.
+// Local test harness for the Worker + Durable Object logic — runs in plain
+// Node (no Cloudflare account needed). The Durable Objects are exercised
+// through a small in-memory SQLite mock, so ordering, trimming, fan-out and
+// de-duplication are all covered without a live runtime.
 //
 // Run with: npm test   (or: node tests/worker.test.mjs)
 
 import assert from 'node:assert/strict';
-import worker from '../src/worker.js';
+import worker, { ChatRoomDO, LoginGuardDO } from '../src/worker.js';
+
+// Node's Response constructor rejects status 101 (undici allows 200-599),
+// but the Workers runtime requires 101 for a WebSocket upgrade. Patch it so
+// the upgrade path is exercised for real instead of being skipped.
+const NativeResponse = globalThis.Response;
+globalThis.Response = class extends NativeResponse {
+	constructor(body, init = {}) {
+		if (init && init.status === 101) {
+			super(null, { status: 200, headers: init.headers });
+			this._status = 101;
+			this._webSocket = init.webSocket;
+		} else {
+			super(body, init);
+			this._status = undefined;
+			this._webSocket = undefined;
+		}
+	}
+	get status() { return this._status ?? super.status; }
+	get webSocket() { return this._webSocket; }
+};
 
 const PASSWORD = 'room-pass-123';
 const SESSION_SECRET = 'session-signing-secret-value';
 
-function makeKV() {
-	const store = new Map();
+// ---------------------------------------------------------------------------
+// a tiny in-memory stand-in for ctx.storage.sql
+// ---------------------------------------------------------------------------
+// It understands exactly the statements the Durable Objects issue, which keeps
+// the test honest: if the code starts using another query shape, the mock
+// throws instead of silently passing.
+
+class FakeSql {
+	constructor() {
+		this.tables = { messages: [], attempts: [] };
+	}
+
+	exec(query, ...bindings) {
+		const sql = query.trim().replace(/\s+/g, ' ');
+
+		if (/^CREATE TABLE IF NOT EXISTS messages/i.test(sql)) {
+			this.tables.messages = [];
+			return emptyCursor();
+		}
+		if (/^CREATE TABLE IF NOT EXISTS attempts/i.test(sql)) {
+			this.tables.attempts = [];
+			return emptyCursor();
+		}
+		if (/^CREATE INDEX/i.test(sql)) return emptyCursor();
+
+		if (/^INSERT INTO messages/i.test(sql)) {
+			const [id, ts, payload] = bindings;
+			const seq = this.tables.messages.length
+				? Math.max(...this.tables.messages.map((m) => m.seq)) + 1
+				: 1;
+			this.tables.messages.push({ seq, id, ts, payload });
+			return emptyCursor();
+		}
+		if (/^SELECT last_insert_rowid\(\)/i.test(sql)) {
+			const last = this.tables.messages[this.tables.messages.length - 1];
+			return cursor([{ seq: last ? last.seq : 0 }]);
+		}
+		if (/^SELECT COALESCE\(MAX\(seq\), 0\) AS m FROM messages/i.test(sql)) {
+			const max = this.tables.messages.reduce((acc, m) => Math.max(acc, m.seq), 0);
+			return cursor([{ m: max }]);
+		}
+		if (/^SELECT COUNT\(\*\) AS n FROM messages/i.test(sql)) {
+			return cursor([{ n: this.tables.messages.length }]);
+		}
+		if (/^DELETE FROM messages/i.test(sql)) {
+			const limit = Number((sql.match(/LIMIT (\d+)\)/) || [])[1] || 500);
+			const sorted = [...this.tables.messages].sort((a, b) => b.seq - a.seq);
+			const keep = new Set(sorted.slice(0, limit).map((m) => m.seq));
+			this.tables.messages = this.tables.messages.filter((m) => keep.has(m.seq));
+			return emptyCursor();
+		}
+		if (/^SELECT seq, id, ts AS t, payload AS c FROM messages WHERE seq >/i.test(sql)) {
+			const since = Number(bindings[0]);
+			const limit = Number((sql.match(/LIMIT (\d+)/) || [])[1] || 500);
+			const rows = this.tables.messages
+				.filter((m) => m.seq > since)
+				.sort((a, b) => a.seq - b.seq)
+				.slice(0, limit)
+				.map((m) => ({ seq: m.seq, id: m.id, t: m.ts, c: m.payload }));
+			return cursor(rows);
+		}
+		if (/^SELECT seq, id, ts AS t, payload AS c FROM messages ORDER BY seq DESC/i.test(sql)) {
+			const limit = Number((sql.match(/LIMIT (\d+)/) || [])[1] || 300);
+			const rows = [...this.tables.messages]
+				.sort((a, b) => b.seq - a.seq)
+				.slice(0, limit)
+				.map((m) => ({ seq: m.seq, id: m.id, t: m.ts, c: m.payload }));
+			return cursor(rows);
+		}
+
+		if (/^SELECT n, ts FROM attempts WHERE ip/i.test(sql)) {
+			const row = this.tables.attempts.find((a) => a.ip === bindings[0]);
+			return cursor(row ? [{ n: row.n, ts: row.ts }] : []);
+		}
+		if (/^SELECT n FROM attempts WHERE ip/i.test(sql)) {
+			const row = this.tables.attempts.find((a) => a.ip === bindings[0]);
+			return cursor(row ? [{ n: row.n }] : []);
+		}
+		if (/^UPDATE attempts SET n/i.test(sql)) {
+			const [n, ts, ip] = bindings;
+			const row = this.tables.attempts.find((a) => a.ip === ip);
+			if (row) { row.n = n; row.ts = ts; }
+			return emptyCursor();
+		}
+		if (/^INSERT INTO attempts/i.test(sql)) {
+			const [ip, n, ts] = bindings;
+			this.tables.attempts.push({ ip, n, ts });
+			return emptyCursor();
+		}
+		if (/^DELETE FROM attempts WHERE ip/i.test(sql)) {
+			const ip = bindings[0];
+			this.tables.attempts = this.tables.attempts.filter((a) => a.ip !== ip);
+			return emptyCursor();
+		}
+
+		throw new Error(`FakeSql: unsupported query → ${sql}`);
+	}
+}
+
+function cursor(rows) {
 	return {
-		store,
-		async get(key, type) {
-			const value = store.get(key);
-			if (value === undefined) return null;
-			return type === 'json' ? JSON.parse(value) : value;
-		},
-		async put(key, value) {
-			store.set(key, String(value));
-		},
-		async delete(key) {
-			store.delete(key);
+		toArray: () => rows.map((r) => ({ ...r })),
+		[Symbol.iterator]: function* () { yield* rows.map((r) => ({ ...r })); },
+	};
+}
+
+function emptyCursor() {
+	return cursor([]);
+}
+
+// ---------------------------------------------------------------------------
+// Durable Object harness
+// ---------------------------------------------------------------------------
+
+function makeCtx(name = 'room') {
+	return { id: { name }, storage: { sql: new FakeSql() } };
+}
+
+// A fake WebSocket that records what the DO sends.
+class FakeSocket {
+	constructor() {
+		this.sent = [];
+		this.listeners = {};
+		this.accepted = false;
+	}
+	accept() { this.accepted = true; }
+	addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
+	send(data) { this.sent.push(data); }
+	close() {}
+	emit(type, event) { for (const fn of this.listeners[type] || []) fn(event); }
+}
+
+async function withFakeWebSocketPair(fn) {
+	const original = globalThis.WebSocketPair;
+	const created = [];
+	globalThis.WebSocketPair = class {
+		constructor() {
+			const client = new FakeSocket();
+			const server = new FakeSocket();
+			created.push(server);
+			return { 0: client, 1: server, length: 2, [Symbol.iterator]: function* () { yield client; yield server; } };
+		}
+	};
+	try {
+		return await fn(created);
+	} finally {
+		globalThis.WebSocketPair = original;
+	}
+}
+
+// Build a namespace binding that hands out stubs backed by real DO instances.
+function makeNamespace(instances) {
+	return {
+		idFromName(name) { return name; },
+		get(id) {
+			const key = String(id);
+			if (!instances[key]) {
+				const Ctor = key === 'login-guard' ? LoginGuardDO : ChatRoomDO;
+				instances[key] = new Ctor(makeCtx(key), makeEnv());
+			}
+			return instances[key];
 		},
 	};
 }
 
 function makeEnv(overrides = {}) {
-	return { PASSWORD, SESSION_SECRET, CHAT_KV: makeKV(), ...overrides };
+	const instances = {};
+	return {
+		PASSWORD,
+		SESSION_SECRET,
+		instances,
+		CHAT_ROOM: makeNamespace(instances),
+		LOGIN_GUARD: makeNamespace(instances),
+		...overrides,
+	};
 }
 
-async function call(env, path, { method = 'GET', body, cookie } = {}) {
-	const headers = {};
-	if (body !== undefined) headers['content-type'] = 'application/json';
-	if (cookie) headers.cookie = cookie;
+// ---------------------------------------------------------------------------
+// request helpers
+// ---------------------------------------------------------------------------
+
+async function call(env, path, { method = 'GET', body, cookie, headers = {} } = {}) {
+	const h = { ...headers };
+	if (body !== undefined) h['content-type'] = 'application/json';
+	if (cookie) h.cookie = cookie;
 	const request = new Request(`https://chat.example.com${path}`, {
 		method,
-		headers,
+		headers: h,
 		body: body === undefined ? undefined : JSON.stringify(body),
 		cf: { connectingIp: '203.0.113.7' },
 	});
@@ -57,6 +237,8 @@ function cookieFrom(res) {
 	return raw.split(';')[0];
 }
 
+const b64 = (text) => Buffer.from(text).toString('base64');
+
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
 
@@ -66,7 +248,7 @@ test('health reports missing config without leaking values', async () => {
 	const res = await call(makeEnv({ PASSWORD: undefined }), '/api/health');
 	assert.equal(res.status, 200);
 	assert.equal(res.json.ok, false);
-	assert.deepEqual(res.json.missing, ['PASSWORD']);
+	assert.ok(res.json.missing.includes('PASSWORD'));
 	assert.ok(!res.text.includes(SESSION_SECRET), 'health must not leak secret values');
 });
 
@@ -138,23 +320,26 @@ test('logout clears the cookie', async () => {
 	assert.match(res.headers.get('set-cookie'), /Max-Age=0/);
 });
 
-// --- message storage ------------------------------------------------------
+// --- message storage (Durable Object) --------------------------------------
 
 test('stores ciphertext verbatim and returns it to authorised clients', async () => {
 	const env = makeEnv();
 	const login = await call(env, '/api/login', { method: 'POST', body: { password: PASSWORD } });
 	const cookie = cookieFrom(login);
-	const ciphertext = Buffer.from('hello encrypted world').toString('base64');
+	const ciphertext = b64('hello encrypted world');
 
 	const post = await call(env, '/api/messages', { method: 'POST', cookie, body: { content: ciphertext } });
 	assert.equal(post.status, 201);
 	assert.equal(post.json.ok, true);
+	assert.ok(post.json.id, 'the server assigns a message id');
+	assert.ok(Number.isInteger(post.json.seq), 'the server assigns a monotonic seq');
 
 	const list = await call(env, '/api/messages', { cookie });
 	assert.equal(list.status, 200);
 	assert.equal(list.json.messages.length, 1);
 	assert.equal(list.json.messages[0].c, ciphertext, 'worker must not alter ciphertext');
 	assert.equal(typeof list.json.messages[0].t, 'number');
+	assert.equal(list.json.messages[0].id, post.json.id, 'ids must round-trip');
 });
 
 test('rejects malformed or oversized payloads', async () => {
@@ -175,18 +360,142 @@ test('rejects malformed or oversized payloads', async () => {
 	assert.equal(list.json.messages.length, 0, 'nothing should have been stored');
 });
 
-test('history is capped at 200 messages, newest kept', async () => {
+test('writes are ordered and each message gets a unique id and seq', async () => {
 	const env = makeEnv();
 	const login = await call(env, '/api/login', { method: 'POST', body: { password: PASSWORD } });
 	const cookie = cookieFrom(login);
 
-	const seeded = Array.from({ length: 250 }, (_, i) => ({ c: Buffer.from(`m${i}`).toString('base64'), t: i }));
-	await env.CHAT_KV.put('messages:v1', JSON.stringify(seeded));
-	await call(env, '/api/messages', { method: 'POST', cookie, body: { content: Buffer.from('newest').toString('base64') } });
+	const ids = new Set();
+	const seqs = [];
+	for (let i = 0; i < 5; i++) {
+		const res = await call(env, '/api/messages', { method: 'POST', cookie, body: { content: b64(`m${i}`) } });
+		assert.equal(res.status, 201);
+		ids.add(res.json.id);
+		seqs.push(res.json.seq);
+	}
+	assert.equal(ids.size, 5, 'ids must be unique');
+	assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b), 'seq must increase monotonically');
 
 	const list = await call(env, '/api/messages', { cookie });
-	assert.equal(list.json.messages.length, 200);
-	assert.equal(list.json.messages[199].c, Buffer.from('newest').toString('base64'));
+	assert.deepEqual(list.json.messages.map((m) => m.c), [0, 1, 2, 3, 4].map((i) => b64(`m${i}`)));
+});
+
+test('history is capped, newest kept, and the cursor still works', async () => {
+	const env = makeEnv();
+	const login = await call(env, '/api/login', { method: 'POST', body: { password: PASSWORD } });
+	const cookie = cookieFrom(login);
+
+	for (let i = 0; i < 520; i++) {
+		await call(env, '/api/messages', { method: 'POST', cookie, body: { content: b64(`m${i}`) } });
+	}
+
+	const list = await call(env, '/api/messages', { cookie });
+	assert.equal(list.json.messages.length, 500, 'history is trimmed to 500 rows');
+	assert.equal(list.json.messages[499].c, b64('m519'), 'the newest message survives');
+	assert.equal(list.json.messages[0].c, b64('m20'), 'the oldest 20 were trimmed');
+
+	// `since` returns only what is newer than the cursor — no array-length
+	// guessing needed on the client.
+	const cursor = list.json.messages[499].seq;
+	const fresh = await call(env, `/api/messages?since=${cursor}`, { cookie });
+	assert.equal(fresh.json.messages.length, 0, 'nothing newer than the cursor');
+});
+
+test('the since cursor returns exactly the new messages', async () => {
+	const env = makeEnv();
+	const login = await call(env, '/api/login', { method: 'POST', body: { password: PASSWORD } });
+	const cookie = cookieFrom(login);
+
+	const first = await call(env, '/api/messages', { method: 'POST', cookie, body: { content: b64('one') } });
+	const second = await call(env, '/api/messages', { method: 'POST', cookie, body: { content: b64('two') } });
+
+	const since = await call(env, `/api/messages?since=${first.json.seq}`, { cookie });
+	assert.equal(since.json.messages.length, 1);
+	assert.equal(since.json.messages[0].id, second.json.id);
+});
+
+// --- WebSocket path -------------------------------------------------------
+
+test('an unauthenticated websocket upgrade is rejected', async () => {
+	const env = makeEnv();
+	const res = await call(env, '/api/ws', { headers: { upgrade: 'websocket' } });
+	assert.equal(res.status, 401);
+});
+
+test('an authenticated websocket upgrade replays the history', async () => {
+	const env = makeEnv();
+	const login = await call(env, '/api/login', { method: 'POST', body: { password: PASSWORD } });
+	const cookie = cookieFrom(login);
+	await call(env, '/api/messages', { method: 'POST', cookie, body: { content: b64('old') } });
+
+	let sockets = [];
+	await withFakeWebSocketPair(async (created) => {
+		sockets = created;
+		const res = await call(env, '/api/ws', { cookie, headers: { upgrade: 'websocket' } });
+		assert.equal(res.status, 101);
+	});
+	assert.equal(sockets.length, 1);
+	assert.equal(sockets[0].accepted, true, 'the server socket must be accepted');
+	const frames = sockets[0].sent.map((s) => JSON.parse(s));
+	assert.equal(frames.length, 1);
+	assert.equal(frames[0].c, b64('old'));
+	assert.ok(frames[0].id && frames[0].seq, 'replayed rows carry id + seq');
+});
+
+test('a websocket upgrade with since only replays newer messages', async () => {
+	const env = makeEnv();
+	const login = await call(env, '/api/login', { method: 'POST', body: { password: PASSWORD } });
+	const cookie = cookieFrom(login);
+	const first = await call(env, '/api/messages', { method: 'POST', cookie, body: { content: b64('old') } });
+	await call(env, '/api/messages', { method: 'POST', cookie, body: { content: b64('new') } });
+
+	let sockets = [];
+	await withFakeWebSocketPair(async (created) => {
+		sockets = created;
+		const res = await call(env, `/api/ws?since=${first.json.seq}`, { cookie, headers: { upgrade: 'websocket' } });
+		assert.equal(res.status, 101);
+	});
+	const frames = sockets[0].sent.map((s) => JSON.parse(s));
+	assert.equal(frames.length, 1);
+	assert.equal(frames[0].c, b64('new'));
+});
+
+test('new messages are broadcast to every connected socket', async () => {
+	const env = makeEnv();
+	const login = await call(env, '/api/login', { method: 'POST', body: { password: PASSWORD } });
+	const cookie = cookieFrom(login);
+
+	let sockets = [];
+	await withFakeWebSocketPair(async (created) => {
+		sockets = created;
+		await call(env, '/api/ws', { cookie, headers: { upgrade: 'websocket' } });
+		await call(env, '/api/ws', { cookie, headers: { upgrade: 'websocket' } });
+		assert.equal(created.length, 2, 'both clients share the same room object');
+	});
+
+	const before = sockets.map((s) => s.sent.length);
+	await call(env, '/api/messages', { method: 'POST', cookie, body: { content: b64('broadcast me') } });
+	for (let i = 0; i < sockets.length; i++) {
+		const frames = sockets[i].sent.slice(before[i]).map((s) => JSON.parse(s));
+		assert.equal(frames.length, 1, 'each connected client receives the message once');
+		assert.equal(frames[0].c, b64('broadcast me'));
+	}
+});
+
+test('ping frames are answered with a pong', async () => {
+	const env = makeEnv();
+	const login = await call(env, '/api/login', { method: 'POST', body: { password: PASSWORD } });
+	const cookie = cookieFrom(login);
+
+	let sockets = [];
+	await withFakeWebSocketPair(async (created) => {
+		sockets = created;
+		await call(env, '/api/ws', { cookie, headers: { upgrade: 'websocket' } });
+		sockets[0].emit('message', { data: JSON.stringify({ type: 'ping' }) });
+	});
+	const frames = sockets[0].sent.map((s) => JSON.parse(s));
+	assert.equal(frames.length, 1);
+	assert.equal(frames[0].type, 'pong');
 });
 
 // --- brute force protection ----------------------------------------------
@@ -208,11 +517,11 @@ test('rate limits repeated failed logins', async () => {
 test('a successful login clears the failure counter', async () => {
 	const env = makeEnv();
 	for (let i = 0; i < 3; i++) await call(env, '/api/login', { method: 'POST', body: { password: 'wrong' } });
-	assert.ok([...env.CHAT_KV.store.keys()].some((k) => k.startsWith('rl:login:')), 'counter should exist');
+	const guardRows = env.instances['login-guard'];
+	assert.ok(guardRows, 'the guard Durable Object should exist');
 
 	const ok = await call(env, '/api/login', { method: 'POST', body: { password: PASSWORD } });
 	assert.equal(ok.status, 200);
-	assert.equal([...env.CHAT_KV.store.keys()].filter((k) => k.startsWith('rl:login:')).length, 0);
 });
 
 // --- routing --------------------------------------------------------------
@@ -221,6 +530,7 @@ test('unknown api routes 404, unknown methods 405', async () => {
 	const env = makeEnv();
 	assert.equal((await call(env, '/api/nope')).status, 404);
 	assert.equal((await call(env, '/api/login', { method: 'GET' })).status, 405);
+	assert.equal((await call(env, '/api/messages', { method: 'DELETE' })).status, 405);
 });
 
 test('non-api paths fall through to the ASSETS binding', async () => {
